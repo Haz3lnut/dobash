@@ -1,1 +1,424 @@
+#$/bin/bash
+
+# Dependencies...
+# jq: https://stedolan.github.io/jq/
+#
+# $CURL: from your package manager (ie, apt-get install $CURL or yum install $CURL)
+#
+
+# Functions Provided
+#
+# Actions...
+# create, destroy, poweroff, poweron, snapshot, restore
+#
+# Information...
+# list, listdroplets, listkeys, listips, listmyimages 
+# getidbyname, getname
+# 
+# 
+
+# Put your API access token here. 
+# I recommend using a file instead of entering the actual token in this script
+# And your file should be protected eg: "chmod 0600 tokenfilename"
+TOKEN=""
+TOKENFILE="$HOME/.keys/digitalocean.api.token"
+
+# temporary file to store api feedback
+DOJSON="/tmp/do.json"
+
+# Defaults for create() action
+# Todo: move this to a config file
+REGION="nyc3"
+SIZE="512mb"
+IMAGE="ubuntu-14-04-x64"
+SSH_KEYS="1200130"   # only one key supported at this time
+BACKUPS=false
+IPV6=false
+USER_DATA=null
+PRIVATE_NETWORKING=true
+
+# API URLs
+DROPURL="https://api.digitalocean.com/v2/droplets"
+KEYURL="https://api.digitalocean.com/v2/account/keys"
+IMGURL="https://api.digitalocean.com/v2/images"
+
+
+if [ ! -z $TOKENFILE ] && [ -f $TOKENFILE ]; then
+   TOKEN=$(cat $TOKENFILE)
+fi
+
+# Check for dependencies
+JQ=$(which jq)
+if [ -z $JQ ]; then
+   echo "Please install jq"
+   echo "You can find it here: https://stedolan.github.io/jq/"
+   echo ""
+   exit 1;
+fi
+
+CURL=$(which curl)
+if [ -z $CURL ]; then
+   echo "Please install Curl from your package manager"
+   echo ""
+   exit 1;
+fi
+
+# Create the output file for JSON results and make it only usable by me
+touch $DOJSON
+chmod 0600 $DOJSON
+
+function cleanup () 
+{
+   #echo -e "\nCleaning up...\n"
+   myjobs=$(jobs -p)
+   if [ ! -z $myjobs ]; then
+      echo $myjobs | xargs kill; 
+   fi
+   rm -f $DOJSON; 
+   
+}
+
+trap "cleanup"  EXIT
+
+SELF=$(basename $0)
+USAGE=`cat << EOF
+USAGE: $SELF [subcommand] [options] 
+
+Available commands:
+
+   list [droplet_id] [target] - Generic list attributes of a droplet (actions, kernels, snapshots, etc)
+   listdroplets [droplet_id]  - List droplets: ID NAME PUBLIC_IP
+   listkeys [droplet_id]      - List all SSH keys
+   listips [droplet_id]       - List all ip addresses of given droplet id
+   listmyimages [droplet_id]  - List personal backup images and snapshots
+   getidbyname [droplet_name] - Retrieve a droplet id given the droplet name
+   getname [droplet_id]       - Retrieve the name associated with a droplet id   
+   help                       - Show this help message
+
+   create    - Create a new droplet [name is the only required option]
+   Example: $SELF create name=My.Cool.Droplet <region=nyc3> <size=1gb> <image=ubuntu-14-04-x64> <ssh_keys=null> <backups=false> <ipv6=false> <user_data=null> <private_networking=true>
+               
+   shutdown [droplet_id]
+   poweroff [droplet_id]
+   poweron  [droplet_id]
+   snapshot [droplet_id]
+   restore  [snapshot_id] [droplet_id]
+   destroy  [droplet_id]
+   
+EOF`
+
+
+# ******************************************************************************
+# Print usage notes and optional error message, then exit.
+# Args: $@ == text string containing error message
+# ******************************************************************************
+function usage()
+{
+    printf "%s\n" "$USAGE"
+    exit 1
+}
+
+
+# *****************************************
+#
+#                INFORMATION
+#
+# *****************************************
+
+function list()
+{
+	id=$1
+	action=$2
+	$CURL -s -X GET -H 'Content-Type: application/json' -H "Authorization: Bearer $TOKEN" "$DROPURL/$id/$action" > "$DOJSON"
+   "$JQ" '.' "$DOJSON" 
+}
+
+
+function listdroplets()
+{
+   $CURL -s -X GET -H 'Content-Type: application/json' -H "Authorization: Bearer $TOKEN" "$DROPURL" > "$DOJSON"
+
+   "$JQ" -r '.droplets[] | "\(.id) \(.name) \(.networks.v4[] | select(.type == "public") | .ip_address)"' "$DOJSON" 
+}
+
+function listkeys()
+{
+   $CURL -s -X GET -H 'Content-Type: application/json' -H "Authorization: Bearer $TOKEN" "$KEYURL" > "$DOJSON"
+
+   "$JQ" -r '.ssh_keys[] | "\(.id) \(.name)"' "$DOJSON" 
+
+}
+
+function listips()
+{
+   id=$1
+   $CURL -s -X GET -H 'Content-Type: application/json' -H "Authorization: Bearer $TOKEN" "$DROPURL/$id" > "$DOJSON"
+
+   "$JQ" -r '.[].networks.v4[] | "\(.type) \(.ip_address)"' "$DOJSON" 
+}
+
+function listmyimages()
+{
+   id=$1
+   $CURL -s -X GET -H 'Content-Type: application/json' -H "Authorization: Bearer $TOKEN" "$IMGURL?private=true" > "$DOJSON"
+
+   "$JQ" -r '.images[] | "\(.id) \(.name) \(.distribution)"' "$DOJSON" 
+}
+
+
+function getidbyname()
+{
+   name="$1"
+   $CURL -s -X GET -H 'Content-Type: application/json' -H "Authorization: Bearer $TOKEN" "$DROPURL" > "$DOJSON"
+
+   "$JQ" -r ".droplets[] | select(.name == \"$name\") | .id" "$DOJSON" 
+
+}
+
+
+function getname()
+{
+   id=$1
+   $CURL -s -X GET -H 'Content-Type: application/json' -H "Authorization: Bearer $TOKEN" "$DROPURL/$id" > "$DOJSON"
+
+   "$JQ" -r ".[].name" "$DOJSON" 
+}
+
+
+# *****************************************
+#
+#                ACTIONS
+#
+# *****************************************
+
+function create()
+{
+   for i in "$@"
+   do
+   case $i in
+      name=* )
+         shift
+         NAME="${i#*=}"
+      ;;
+       
+      region=*)
+         shift
+         REGION="${i#*=}"
+      ;;
+       
+      size=*)
+         shift
+         SIZE="${i#*=}"
+      ;;
+       
+      image=*)
+         shift
+         IMAGE="${i#*=}"
+      ;;
+       
+      ssh_keys=*)
+         shift
+         SSH_KEYS="${i#*=}"
+      ;;
+       
+      backups=*)
+         shift
+         BACKUPS="${i#*=}"
+      ;;
+
+      ipv6=*)
+         shift
+         IPV6="${i#*=}"
+      ;;
+
+      user_data=*)
+         shift
+         USER_DATA="${i#*=}"
+      ;;
+
+      private_networking=*)
+         shift
+         PRIVATE_NETWORKING="${i#*=}"
+      ;;
+       
+      *)
+              # unknown option
+      ;;
+   esac
+   done
+
+   if [ -z $NAME ]; then
+      echo -e "ERROR, you must specify at least a droplet name.\nie: $SELF create name=My.New.Droplet\n"
+      exit 1
+   fi
+   REQDATA=`cat << EOF
+   {"name":"$NAME",
+    "region":"$REGION",
+    "size":"$SIZE",
+    "image":"$IMAGE",
+    "ssh_keys":[$SSH_KEYS],
+    "backups":$BACKUPS,
+    "ipv6":$IPV6,
+    "user_data":$USER_DATA,
+    "private_networking":$PRIVATE_NETWORKING
+   }
+EOF`
+   
+   $CURL -s -X POST -H 'Content-Type: application/json' -H "Authorization: Bearer $TOKEN" \
+   -d "$REQDATA" "$DROPURL" > "$DOJSON"
+   
+   "$JQ" '.' "$DOJSON" 
+}
+
+function shutdown()
+{
+   id=$1
+   $CURL -s -X POST -H 'Content-Type: application/json' -H "Authorization: Bearer $TOKEN" \
+   -d '{"type":"shutdown"}' "$DROPURL/$id/actions" > "$DOJSON"
+   "$JQ" '.' "$DOJSON" 
+   
+}
+
+function poweroff()
+{
+   id=$1
+   $CURL -s -X POST -H 'Content-Type: application/json' -H "Authorization: Bearer $TOKEN" \
+   -d '{"type":"power_off"}' "$DROPURL/$id/actions" > "$DOJSON"
+   "$JQ" '.' "$DOJSON" 
+}
+
+function poweron()
+{
+   id=$1
+   $CURL -s -X POST -H 'Content-Type: application/json' -H "Authorization: Bearer $TOKEN" \
+   -d '{"type":"power_on"}' "$DROPURL/$id/actions" > "$DOJSON"
+   "$JQ" '.' "$DOJSON" 
+}
+
+function snapshot()
+{
+   id=$1
+   $CURL -s -X POST -H 'Content-Type: application/json' -H "Authorization: Bearer $TOKEN" \
+   -d '{"type":"snapshot"}' "$DROPURL/$id/actions" > "$DOJSON"
+   "$JQ" '.' "$DOJSON" 
+}
+
+function restore()
+{
+   sid=$1
+   did=$2
+   $CURL -s -X POST -H 'Content-Type: application/json' -H "Authorization: Bearer $TOKEN" \
+   -d "{\"type\":\"restore\", \"image\": $sid }" "$DROPURL/$did/actions" > "$DOJSON"
+   
+   "$JQ" '.' "$DOJSON" 
+}
+
+function destroy()
+{
+   id=$1
+   $CURL -s -X DELETE -H 'Content-Type: application/json' -H "Authorization: Bearer $TOKEN" "$DROPURL/$id" > "$DOJSON"
+   
+   "$JQ" '.' "$DOJSON" 
+}
+
+# *****************************
+# Read command line arguments
+# *****************************
+function get_args()
+{
+   # Parse command line arguments
+   while test $# -gt 0; do
+      DO_SHIFT=:
+      case "$1" in
+
+      "help" )
+         usage;
+         exit;
+         ;;
+
+      "list" )
+      	shift
+         list $@;
+         break;
+         ;;
+		
+      "listdroplets" )
+         listdroplets;
+         ;;
+
+      "listkeys" )
+         listkeys;
+         ;;
+
+      "listips" )
+         shift
+         listips "$1"
+         ;;
+
+      "listmyimages" )
+         shift
+         listmyimages;
+         ;;
+
+      "getidbyname" )
+         shift
+         getidbyname "$1"
+         ;;
+
+      "getname" )
+         shift
+         getname "$1"
+         ;;
+         
+      "create" )
+         create $@
+         break;
+         ;;         
+
+      "shutdown" )
+         shift
+         poweroff "$1"
+         ;;
+       
+      "poweroff" )
+         shift
+         poweroff "$1"
+         ;;
+       
+      "poweron" )
+         shift
+         poweron "$1"
+         ;;
+
+      "snapshot" )
+         shift
+         snapshot "$1"
+         ;;
+         
+      "restore" )
+         restore $@
+         break;
+         ;;
+         
+      "destroy" )
+         shift
+         destroy "$1"
+         ;;
+                           
+      *)
+         echo -e "\nUnknown command: $1\n"
+      ;;
+      esac
+
+      # Get next argument
+      $DO_SHIFT && shift
+   done
+} # End get_args()
+
+if test $# -lt 1; then
+   usage
+fi
+
+get_args "$@"
+
 
