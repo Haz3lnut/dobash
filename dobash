@@ -4,7 +4,7 @@
 #
 # jq: https://stedolan.github.io/jq/
 #
-# $CURL: from your package manager (ie, apt-get install $CURL or yum install $CURL)
+# curl: from your package manager (ie, "apt-get install curl" or "yum install curl")
 #
 
 # Functions Provided
