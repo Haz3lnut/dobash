@@ -1,6 +1,7 @@
 #$/bin/bash
 
 # Dependencies...
+#
 # jq: https://stedolan.github.io/jq/
 #
 # $CURL: from your package manager (ie, apt-get install $CURL or yum install $CURL)
